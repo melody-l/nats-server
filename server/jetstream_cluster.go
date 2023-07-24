@@ -178,6 +178,8 @@ const (
 	jsExcludePlacement   = "!jetstream"
 )
 
+var ErrIncompatibleAssignment = errors.New("assignment incompatible with this server version")
+
 // Returns information useful in mixed mode.
 func (s *Server) trackedJetStreamServers() (js, total int) {
 	s.mu.RLock()
@@ -6667,6 +6669,16 @@ func decodeStreamAssignment(buf []byte) (*streamAssignment, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Round-trip the assignment back to JSON. This is a guard rail as an
+	// asset created with a newer version of the NATS Server might be using
+	// configuration fields that would be lost when they are unmarshalled by
+	// an older version of the server, so we should detect that happening
+	// instead of continuing with the wrong config.
+	if cmp, err := json.Marshal(sa); err != nil {
+		return nil, err
+	} else if !bytes.Equal(bytes.TrimSpace(cmp), bytes.TrimSpace(buf)) {
+		return nil, ErrIncompatibleAssignment
+	}
 	fixCfgMirrorWithDedupWindow(sa.Config)
 	return &sa, err
 }
@@ -6988,6 +7000,16 @@ func encodeDeleteConsumerAssignment(ca *consumerAssignment) []byte {
 func decodeConsumerAssignment(buf []byte) (*consumerAssignment, error) {
 	var ca consumerAssignment
 	err := json.Unmarshal(buf, &ca)
+	// Round-trip the assignment back to JSON. This is a guard rail as an
+	// asset created with a newer version of the NATS Server might be using
+	// configuration fields that would be lost when they are unmarshalled by
+	// an older version of the server, so we should detect that happening
+	// instead of continuing with the wrong config.
+	if cmp, err := json.Marshal(ca); err != nil {
+		return nil, err
+	} else if !bytes.Equal(bytes.TrimSpace(cmp), bytes.TrimSpace(buf)) {
+		return nil, ErrIncompatibleAssignment
+	}
 	return &ca, err
 }
 
@@ -7004,13 +7026,11 @@ func encodeAddConsumerAssignmentCompressed(ca *consumerAssignment) []byte {
 }
 
 func decodeConsumerAssignmentCompressed(buf []byte) (*consumerAssignment, error) {
-	var ca consumerAssignment
 	js, err := s2.Decode(nil, buf)
 	if err != nil {
 		return nil, err
 	}
-	err = json.Unmarshal(js, &ca)
-	return &ca, err
+	return decodeConsumerAssignment(js)
 }
 
 var errBadStreamMsg = errors.New("jetstream cluster bad replicated stream msg")
