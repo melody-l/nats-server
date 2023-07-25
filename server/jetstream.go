@@ -14,6 +14,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
@@ -1243,6 +1244,18 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 		var cfg FileStreamInfo
 		if err := json.Unmarshal(buf, &cfg); err != nil {
 			s.Warnf("  Error unmarshalling stream metafile %q: %v", metafile, err)
+			continue
+		}
+		// Round-trip the stream info back to JSON. This is a guard rail as an
+		// asset created with a newer version of the NATS Server might be using
+		// configuration fields that would be lost when they are unmarshalled by
+		// an older version of the server, so we should detect that happening
+		// instead of continuing with the wrong config.
+		if cmp, err := json.Marshal(cfg); err != nil {
+			s.Warnf("  Error remarshalling stream metafile %q: %v", metafile, err)
+			continue
+		} else if !bytes.Equal(bytes.TrimSpace(cmp), bytes.TrimSpace(buf)) {
+			s.Warnf("  Stream metafile %q is incompatible: %v", metafile, err)
 			continue
 		}
 
