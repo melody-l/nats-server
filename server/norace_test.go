@@ -1126,6 +1126,11 @@ func TestNoRaceJetStreamDeleteStreamManyConsumers(t *testing.T) {
 // This is not limited to the case above, its just the one that exposed it.
 // This test is to show that issue and that the fix works, meaning we no longer swap c.acc.
 func TestNoRaceJetStreamServiceImportAccountSwapIssue(t *testing.T) {
+	t.Run("wait", func(t *testing.T) { testNoRaceJetStreamServiceImportAccountSwapIssue_FetchNoWait(t, false) })
+	t.Run("no_wait", func(t *testing.T) { testNoRaceJetStreamServiceImportAccountSwapIssue_FetchNoWait(t, true) })
+}
+
+func testNoRaceJetStreamServiceImportAccountSwapIssue_FetchNoWait(t *testing.T, noWait bool) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
@@ -1141,19 +1146,28 @@ func TestNoRaceJetStreamServiceImportAccountSwapIssue(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	sub, err := js.PullSubscribe("foo", "dlc")
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Name:          "dlc",
+		FilterSubject: "foo",
+		AckPolicy:     nats.AckExplicitPolicy,
+	})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-
-	beforeSubs := s.NumSubscriptions()
 
 	// How long we want both sides to run.
 	timeout := time.Now().Add(3 * time.Second)
 	errs := make(chan error, 1)
 
-	// Publishing side, which will signal the consumer that is waiting and which will access c.acc. If publish
-	// operation runs concurrently we will catch c.acc being $SYS some of the time.
+	// Pull messages flow.
+	var received int
+	inbox := nc.NewInbox()
+	sub, err := nc.SubscribeSync(inbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc.Flush()
+	beforeSubs := s.NumSubscriptions()
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		for time.Now().Before(timeout) {
@@ -1169,16 +1183,28 @@ func TestNoRaceJetStreamServiceImportAccountSwapIssue(t *testing.T) {
 		errs <- nil
 	}()
 
-	// Pull messages flow.
-	var received int
-	for time.Now().Before(timeout.Add(2 * time.Second)) {
-		if msgs, err := sub.Fetch(1, nats.MaxWait(200*time.Millisecond)); err == nil {
-			for _, m := range msgs {
-				received++
-				m.AckSync()
-			}
+	for time.Now().Before(timeout.Add(1 * time.Second)) {
+		var err error
+		if noWait {
+			err = nc.PublishRequest("$JS.API.CONSUMER.MSG.NEXT.TEST.dlc", inbox, []byte(`{"no_wait":true,"batch":1}`))
 		} else {
-			break
+			err = nc.PublishRequest("$JS.API.CONSUMER.MSG.NEXT.TEST.dlc", inbox, nil)
+		}
+		if err != nil {
+			t.Error(err)
+		}
+		msg, err := sub.NextMsg(200 * time.Millisecond)
+		if err != nil {
+			continue
+		}
+		if len(msg.Header) > 0 {
+			// Some sort of signaling message so skip this response.
+			continue
+		}
+		received++
+		_, err = nc.Request(msg.Reply, nil, 200*time.Millisecond)
+		if err != nil {
+			t.Fatalf("Ack Error: %v", err)
 		}
 	}
 	// Wait on publisher Go routine and check for errors.
@@ -1191,7 +1217,43 @@ func TestNoRaceJetStreamServiceImportAccountSwapIssue(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	if int(si.State.Msgs) != received {
-		t.Fatalf("Expected to receive %d msgs, only got %d", si.State.Msgs, received)
+		// When calling only no_wait to fetch we might be missing a message sometimes.
+		delta := int(si.State.Msgs) - received
+		pending, _, _ := sub.Pending()
+		if delta > 0 && delta != pending {
+			// Make an extra fetch request to get the missing message.
+			if noWait {
+				err = nc.PublishRequest("$JS.API.CONSUMER.MSG.NEXT.TEST.dlc", inbox, []byte(`{"no_wait":true,"batch":1}`))
+			} else {
+				err = nc.PublishRequest("$JS.API.CONSUMER.MSG.NEXT.TEST.dlc", inbox, nil)
+			}
+			if err != nil {
+				t.Error(err)
+			}
+			msg, err := sub.NextMsg(200 * time.Millisecond)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(msg.Header) == 0 {
+				t.Logf("Made an extra fetch request to get last message")
+				received++
+			}
+		} else if delta == pending {
+			// The next message should have been buffered.
+			msg, err := sub.NextMsg(200 * time.Millisecond)
+			if err != nil {
+				t.Error(err)
+			}
+			if len(msg.Header) == 0 {
+				t.Logf("Last message was being buffered")
+				received++
+			}
+		}
+
+		// Check again if counters match.
+		if int(si.State.Msgs) != received {
+			t.Errorf("Expected to receive %d msgs, only got %d", int(si.State.Msgs), received)
+		}
 	}
 	// Now check for leaked subs from the fetch call above. That is what we first saw from the bug.
 	if afterSubs := s.NumSubscriptions(); afterSubs != beforeSubs {
