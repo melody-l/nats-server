@@ -5026,3 +5026,52 @@ func TestJetStreamClusterOrphanConsumerSubjects(t *testing.T) {
 	require_NotEqual(t, info.Cluster.Leader, "")
 	require_Equal(t, len(info.Cluster.Replicas), 2)
 }
+
+func TestJetStreamClusterConsumerInactiveByExLeader(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "STREAM",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	c.waitOnStreamLeader("$G", "STREAM")
+
+	_, err = js.AddConsumer("STREAM", &nats.ConsumerConfig{
+		Name:              "consumer",
+		Replicas:          3,
+		InactiveThreshold: time.Second * 30,
+	})
+	require_NoError(t, err)
+	c.waitOnConsumerLeader("$G", "STREAM", "consumer")
+
+	checkForTimer := func(s *Server) bool {
+		account := s.globalAccount()
+		stream := account.js.streams["STREAM"]
+		consumer := stream.consumers["consumer"]
+		return consumer != nil && consumer.dtmr != nil
+	}
+
+	oldLeader := c.consumerLeader("$G", "STREAM", "consumer")
+	require_True(t, checkForTimer(oldLeader))
+
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		ci, err := js.ConsumerInfo("STREAM", "consumer")
+		require_NoError(t, err)
+		if ci.Cluster.Leader != oldLeader.Name() {
+			return nil
+		}
+		_, err = nc.Request(fmt.Sprintf(JSApiConsumerLeaderStepDownT, "STREAM", "consumer"), nil, time.Second)
+		require_NoError(t, err)
+		return fmt.Errorf("consumer leader has not moved")
+	})
+
+	newLeader := c.consumerLeader("$G", "STREAM", "consumer")
+	require_True(t, checkForTimer(newLeader))
+	require_False(t, checkForTimer(oldLeader))
+}
