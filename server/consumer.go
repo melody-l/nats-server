@@ -1090,8 +1090,7 @@ func (o *consumer) setLeader(isLeader bool) {
 
 		if o.dthresh > 0 && (o.isPullMode() || !o.active) {
 			// Pull consumer. We run the dtmr all the time for this one.
-			stopAndClearTimer(&o.dtmr)
-			o.dtmr = time.AfterFunc(o.dthresh, func() { o.deleteNotActive() })
+			o.kickNotActiveTimerLocked(0)
 		}
 
 		// If we are not in ReplayInstant mode mark us as in replay state until resolved.
@@ -1349,10 +1348,25 @@ func (o *consumer) updateDeliveryInterest(localInterest bool) bool {
 	// If we do not have interest anymore and have a delete threshold set, then set
 	// a timer to delete us. We wait for a bit in case of server reconnect.
 	if !interest && o.dthresh > 0 {
-		o.dtmr = time.AfterFunc(o.dthresh, func() { o.deleteNotActive() })
+		o.kickNotActiveTimerLocked(0)
 		return true
 	}
 	return false
+}
+
+func (o *consumer) kickNotActiveTimerLocked(elapsed time.Duration) {
+	if !o.js.isClustered() || (o.js.isClustered() && o.isLeader()) {
+		// If we are not clustered, or we are both clustered and the
+		// consumer leader, then reset the timer if it exists.
+		if o.dtmr != nil {
+			o.dtmr.Reset(o.dthresh - elapsed)
+		} else {
+			o.dtmr = time.AfterFunc(o.dthresh-elapsed, o.deleteNotActive)
+		}
+	} else if o.dtmr != nil {
+		// If we are not the leader then we shouldn't be running the timer.
+		stopAndClearTimer(&o.dtmr)
+	}
 }
 
 func (o *consumer) deleteNotActive() {
@@ -1373,21 +1387,13 @@ func (o *consumer) deleteNotActive() {
 		elapsed := time.Since(o.waiting.last)
 		if elapsed <= o.cfg.InactiveThreshold {
 			// These need to keep firing so reset but use delta.
-			if o.dtmr != nil {
-				o.dtmr.Reset(o.dthresh - elapsed)
-			} else {
-				o.dtmr = time.AfterFunc(o.dthresh-elapsed, func() { o.deleteNotActive() })
-			}
+			o.kickNotActiveTimerLocked(elapsed)
 			o.mu.Unlock()
 			return
 		}
 		// Check if we still have valid requests waiting.
 		if o.checkWaitingForInterest() {
-			if o.dtmr != nil {
-				o.dtmr.Reset(o.dthresh)
-			} else {
-				o.dtmr = time.AfterFunc(o.dthresh, func() { o.deleteNotActive() })
-			}
+			o.kickNotActiveTimerLocked(0)
 			o.mu.Unlock()
 			return
 		}
@@ -1640,7 +1646,7 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 		stopAndClearTimer(&o.dtmr)
 		// Restart timer only if we are the leader.
 		if o.isLeader() && o.dthresh > 0 {
-			o.dtmr = time.AfterFunc(o.dthresh, func() { o.deleteNotActive() })
+			o.kickNotActiveTimerLocked(0)
 		}
 	}
 
@@ -3417,7 +3423,7 @@ func (o *consumer) suppressDeletion() {
 
 	if o.isPushMode() && o.dtmr != nil {
 		// if dtmr is not nil we have started the countdown, simply reset to threshold.
-		o.dtmr.Reset(o.dthresh)
+		o.kickNotActiveTimerLocked(0)
 	} else if o.isPullMode() && o.waiting != nil {
 		// Pull mode always has timer running, just update last on waiting queue.
 		o.waiting.last = time.Now()
