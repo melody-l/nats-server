@@ -125,6 +125,7 @@ type Server struct {
 	gacc                *Account
 	sys                 *internal
 	js                  *jetStream
+	jsapisub            *subscription
 	accounts            sync.Map
 	tmpAccounts         sync.Map // Temporarily stores accounts that are being built
 	activeAccounts      int32
@@ -3576,6 +3577,9 @@ func (s *Server) lameDuckMode() {
 		gp *= -1
 	}
 	s.mu.Unlock()
+
+	// If we're a JetStream node, stop answering requests on the JS API.
+	s.unsubscribeJetStreamAPIForLDM()
 
 	// If we are running any raftNodes transfer leaders.
 	if hadTransfers := s.transferRaftLeaders(); hadTransfers {

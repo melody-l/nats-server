@@ -816,7 +816,8 @@ func (s *Server) setJetStreamExportSubs() error {
 	s.startGoRoutine(s.processJSAPIRoutedRequests)
 
 	// This is the catch all now for all JetStream API calls.
-	if _, err := s.sysSubscribe(jsAllAPI, js.apiDispatch); err != nil {
+	var err error
+	if s.jsapisub, err = s.sysSubscribe(jsAllAPI, js.apiDispatch); err != nil {
 		return err
 	}
 
@@ -868,6 +869,17 @@ func (s *Server) setJetStreamExportSubs() error {
 		}
 	}
 
+	return nil
+}
+
+func (s *Server) unsubscribeJetStreamAPIForLDM() error {
+	js := s.getJetStream()
+	if js == nil {
+		return NewJSNotEnabledError()
+	}
+
+	s.sysUnsubscribe(s.jsapisub)
+	s.jsapisub = nil
 	return nil
 }
 
