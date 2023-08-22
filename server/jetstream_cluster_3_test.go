@@ -3158,7 +3158,8 @@ func TestJetStreamClusterConsumerFollowerStoreStateAckFloorBug(t *testing.T) {
 		m.AckSync()
 	}
 
-	checkConsumerState := func(delivered, ackFloor nats.SequenceInfo, numAckPending int) {
+	checkConsumerState := func(t *testing.T, delivered, ackFloor nats.SequenceInfo, numAckPending int) {
+		t.Helper()
 		expectedDelivered := uint64(num) + 1
 		if delivered.Stream != expectedDelivered || delivered.Consumer != expectedDelivered {
 			t.Fatalf("Wrong delivered, expected %d got %+v", expectedDelivered, delivered)
@@ -3172,10 +3173,10 @@ func TestJetStreamClusterConsumerFollowerStoreStateAckFloorBug(t *testing.T) {
 
 	ci, err := js.ConsumerInfo("TEST", "C")
 	require_NoError(t, err)
-	checkConsumerState(ci.Delivered, ci.AckFloor, ci.NumAckPending)
+	checkConsumerState(t, ci.Delivered, ci.AckFloor, ci.NumAckPending)
 
 	// Check each consumer on each server for it's store state and make sure it matches as well.
-	for _, s := range c.servers {
+	for i, s := range c.servers {
 		mset, err := s.GlobalAccount().lookupStream("TEST")
 		require_NoError(t, err)
 		require_NotNil(t, mset)
@@ -3187,7 +3188,8 @@ func TestJetStreamClusterConsumerFollowerStoreStateAckFloorBug(t *testing.T) {
 
 		delivered := nats.SequenceInfo{Stream: state.Delivered.Stream, Consumer: state.Delivered.Consumer}
 		ackFloor := nats.SequenceInfo{Stream: state.AckFloor.Stream, Consumer: state.AckFloor.Consumer}
-		checkConsumerState(delivered, ackFloor, len(state.Pending))
+		checkConsumerState(t, delivered, ackFloor, len(state.Pending))
+		t.Logf("%v was ok", i)
 	}
 
 	// Now stepdown the consumer and move its leader and check the state after transition.
@@ -3217,7 +3219,7 @@ func TestJetStreamClusterConsumerFollowerStoreStateAckFloorBug(t *testing.T) {
 			seen[cl] = true
 			ci, err := js.ConsumerInfo("TEST", "C")
 			require_NoError(t, err)
-			checkConsumerState(ci.Delivered, ci.AckFloor, ci.NumAckPending)
+			checkConsumerState(t, ci.Delivered, ci.AckFloor, ci.NumAckPending)
 			cl.JetStreamStepdownConsumer(globalAccountName, "TEST", "C")
 			return fmt.Errorf("Not all servers have been consumer leader yet")
 		})
