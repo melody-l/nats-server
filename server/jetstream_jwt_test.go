@@ -364,7 +364,7 @@ func TestJetStreamJWTMove(t *testing.T) {
 					} else if len(si.Cluster.Replicas) != replicas-1 {
 						return fmt.Errorf("Expected %d replicas, got %d", replicas-1, len(si.Cluster.Replicas))
 					} else if si.State.Msgs != 1 {
-						return fmt.Errorf("expected one message")
+						return fmt.Errorf("expected one message, got %d", si.State.Msgs)
 					}
 					// Now make sure consumer has leader etc..
 					if ci, err := js.ConsumerInfo("MOVE-ME", "dur"); err != nil {
