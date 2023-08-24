@@ -352,7 +352,7 @@ func TestJetStreamJWTMove(t *testing.T) {
 
 		sc.clusterForName("C2").waitOnStreamLeader(aExpPub, "MOVE-ME")
 
-		checkFor(t, 30*time.Second, 250*time.Millisecond, func() error {
+		checkFor(t, 20*time.Second, 250*time.Millisecond, func() error {
 			if si, err := js.StreamInfo("MOVE-ME"); err != nil {
 				return fmt.Errorf("stream: %v", err)
 			} else if si.Cluster.Name != "C2" {
