@@ -276,18 +276,20 @@ func TestJetStreamJWTDisallowBearer(t *testing.T) {
 }
 
 func TestJetStreamJWTMove(t *testing.T) {
-	sysKp, syspub := createKey(t)
-	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
-	sysCreds := newUser(t, sysKp)
+	for i := 0; i < 10; i++ {
+		t.Run(fmt.Sprintf("run %d", i), func(t *testing.T) {
+			sysKp, syspub := createKey(t)
+			sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+			sysCreds := newUser(t, sysKp)
 
-	accKp, aExpPub := createKey(t)
+			accKp, aExpPub := createKey(t)
 
-	test := func(t *testing.T, replicas int, accClaim *jwt.AccountClaims) {
-		accClaim.Name = "acc"
-		accJwt := encodeClaim(t, accClaim, aExpPub)
-		accCreds := newUser(t, accKp)
+			test := func(t *testing.T, replicas int, accClaim *jwt.AccountClaims) {
+				accClaim.Name = "acc"
+				accJwt := encodeClaim(t, accClaim, aExpPub)
+				accCreds := newUser(t, accKp)
 
-		tmlp := `
+				tmlp := `
 			listen: 127.0.0.1:-1
 			server_name: %s
 			jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
@@ -300,13 +302,13 @@ func TestJetStreamJWTMove(t *testing.T) {
 				routes = [%s]
 			}
 		`
-		sc := createJetStreamSuperClusterWithTemplateAndModHook(t, tmlp, 5, 2,
-			func(serverName, clustername, storeDir, conf string) string {
-				switch sname := serverName[strings.Index(serverName, "-")+1:]; sname {
-				case "S1", "S2":
-					conf = strings.ReplaceAll(conf, "jetstream", "#jetstream")
-				}
-				return conf + fmt.Sprintf(`
+				sc := createJetStreamSuperClusterWithTemplateAndModHook(t, tmlp, 5, 2,
+					func(serverName, clustername, storeDir, conf string) string {
+						switch sname := serverName[strings.Index(serverName, "-")+1:]; sname {
+						case "S1", "S2":
+							conf = strings.ReplaceAll(conf, "jetstream", "#jetstream")
+						}
+						return conf + fmt.Sprintf(`
 					server_tags: [cloud:%s-tag]
 					operator: %s
 					system_account: %s
@@ -318,97 +320,99 @@ func TestJetStreamJWTMove(t *testing.T) {
 						%s : %s
 					}
 				`, clustername, ojwt, syspub, storeDir, syspub, sysJwt)
-			}, nil)
-		defer sc.shutdown()
+					}, nil)
+				defer sc.shutdown()
 
-		s := sc.serverByName("C1-S1")
-		require_False(t, s.JetStreamEnabled())
-		updateJwt(t, s.ClientURL(), sysCreds, accJwt, 10)
+				s := sc.serverByName("C1-S1")
+				require_False(t, s.JetStreamEnabled())
+				updateJwt(t, s.ClientURL(), sysCreds, accJwt, 10)
 
-		s = sc.serverByName("C2-S1")
-		require_False(t, s.JetStreamEnabled())
+				s = sc.serverByName("C2-S1")
+				require_False(t, s.JetStreamEnabled())
 
-		nc := natsConnect(t, s.ClientURL(), nats.UserCredentials(accCreds))
-		defer nc.Close()
+				nc := natsConnect(t, s.ClientURL(), nats.UserCredentials(accCreds))
+				defer nc.Close()
 
-		js, err := nc.JetStream()
-		require_NoError(t, err)
+				js, err := nc.JetStream()
+				require_NoError(t, err)
 
-		ci, err := js.AddStream(&nats.StreamConfig{Name: "MOVE-ME", Replicas: replicas,
-			Placement: &nats.Placement{Tags: []string{"cloud:C1-tag"}}})
-		require_NoError(t, err)
-		require_Equal(t, ci.Cluster.Name, "C1")
+				ci, err := js.AddStream(&nats.StreamConfig{Name: "MOVE-ME", Replicas: replicas,
+					Placement: &nats.Placement{Tags: []string{"cloud:C1-tag"}}})
+				require_NoError(t, err)
+				require_Equal(t, ci.Cluster.Name, "C1")
 
-		_, err = js.AddConsumer("MOVE-ME", &nats.ConsumerConfig{Durable: "dur", AckPolicy: nats.AckExplicitPolicy})
-		require_NoError(t, err)
-		_, err = js.Publish("MOVE-ME", []byte("hello world"))
-		require_NoError(t, err)
+				_, err = js.AddConsumer("MOVE-ME", &nats.ConsumerConfig{Durable: "dur", AckPolicy: nats.AckExplicitPolicy})
+				require_NoError(t, err)
+				_, err = js.Publish("MOVE-ME", []byte("hello world"))
+				require_NoError(t, err)
 
-		// Perform actual move
-		ci, err = js.UpdateStream(&nats.StreamConfig{Name: "MOVE-ME", Replicas: replicas,
-			Placement: &nats.Placement{Tags: []string{"cloud:C2-tag"}}})
-		require_NoError(t, err)
-		require_Equal(t, ci.Cluster.Name, "C1")
+				// Perform actual move
+				ci, err = js.UpdateStream(&nats.StreamConfig{Name: "MOVE-ME", Replicas: replicas,
+					Placement: &nats.Placement{Tags: []string{"cloud:C2-tag"}}})
+				require_NoError(t, err)
+				require_Equal(t, ci.Cluster.Name, "C1")
 
-		sc.clusterForName("C2").waitOnStreamLeader(aExpPub, "MOVE-ME")
+				sc.clusterForName("C2").waitOnStreamLeader(aExpPub, "MOVE-ME")
 
-		checkFor(t, 20*time.Second, 250*time.Millisecond, func() error {
-			if si, err := js.StreamInfo("MOVE-ME"); err != nil {
-				return fmt.Errorf("stream: %v", err)
-			} else if si.Cluster.Name != "C2" {
-				return fmt.Errorf("Wrong cluster: %q", si.Cluster.Name)
-			} else if !strings.HasPrefix(si.Cluster.Leader, "C2-") {
-				return fmt.Errorf("Wrong leader: %q", si.Cluster.Leader)
-			} else if len(si.Cluster.Replicas) != replicas-1 {
-				return fmt.Errorf("Expected %d replicas, got %d", replicas-1, len(si.Cluster.Replicas))
-			} else if si.State.Msgs != 1 {
-				return fmt.Errorf("expected one message")
+				checkFor(t, 20*time.Second, 250*time.Millisecond, func() error {
+					if si, err := js.StreamInfo("MOVE-ME"); err != nil {
+						return fmt.Errorf("stream: %v", err)
+					} else if si.Cluster.Name != "C2" {
+						return fmt.Errorf("Wrong cluster: %q", si.Cluster.Name)
+					} else if !strings.HasPrefix(si.Cluster.Leader, "C2-") {
+						return fmt.Errorf("Wrong leader: %q", si.Cluster.Leader)
+					} else if len(si.Cluster.Replicas) != replicas-1 {
+						return fmt.Errorf("Expected %d replicas, got %d", replicas-1, len(si.Cluster.Replicas))
+					} else if si.State.Msgs != 1 {
+						return fmt.Errorf("expected one message")
+					}
+					// Now make sure consumer has leader etc..
+					if ci, err := js.ConsumerInfo("MOVE-ME", "dur"); err != nil {
+						return fmt.Errorf("stream: %v", err)
+					} else if ci.Cluster.Name != "C2" {
+						return fmt.Errorf("Wrong cluster: %q", ci.Cluster.Name)
+					} else if ci.Cluster.Leader == _EMPTY_ {
+						return fmt.Errorf("No leader yet")
+					}
+					return nil
+				})
+
+				sub, err := js.PullSubscribe("", "dur", nats.BindStream("MOVE-ME"))
+				require_NoError(t, err)
+				m, err := sub.Fetch(1)
+				require_NoError(t, err)
+				require_NoError(t, m[0].AckSync())
 			}
-			// Now make sure consumer has leader etc..
-			if ci, err := js.ConsumerInfo("MOVE-ME", "dur"); err != nil {
-				return fmt.Errorf("stream: %v", err)
-			} else if ci.Cluster.Name != "C2" {
-				return fmt.Errorf("Wrong cluster: %q", ci.Cluster.Name)
-			} else if ci.Cluster.Leader == _EMPTY_ {
-				return fmt.Errorf("No leader yet")
-			}
-			return nil
+
+			t.Run("tiered", func(t *testing.T) {
+				accClaim := jwt.NewAccountClaims(aExpPub)
+				accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{
+					DiskStorage: 1100, Consumer: 1, Streams: 1}
+				accClaim.Limits.JetStreamTieredLimits["R3"] = jwt.JetStreamLimits{
+					DiskStorage: 3300, Consumer: 1, Streams: 1}
+
+				t.Run("R3", func(t *testing.T) {
+					test(t, 3, accClaim)
+				})
+				t.Run("R1", func(t *testing.T) {
+					test(t, 1, accClaim)
+				})
+			})
+
+			t.Run("non-tiered", func(t *testing.T) {
+				accClaim := jwt.NewAccountClaims(aExpPub)
+				accClaim.Limits.JetStreamLimits = jwt.JetStreamLimits{
+					DiskStorage: 4400, Consumer: 2, Streams: 2}
+
+				t.Run("R3", func(t *testing.T) {
+					test(t, 3, accClaim)
+				})
+				t.Run("R1", func(t *testing.T) {
+					test(t, 1, accClaim)
+				})
+			})
 		})
-
-		sub, err := js.PullSubscribe("", "dur", nats.BindStream("MOVE-ME"))
-		require_NoError(t, err)
-		m, err := sub.Fetch(1)
-		require_NoError(t, err)
-		require_NoError(t, m[0].AckSync())
 	}
-
-	t.Run("tiered", func(t *testing.T) {
-		accClaim := jwt.NewAccountClaims(aExpPub)
-		accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{
-			DiskStorage: 1100, Consumer: 1, Streams: 1}
-		accClaim.Limits.JetStreamTieredLimits["R3"] = jwt.JetStreamLimits{
-			DiskStorage: 3300, Consumer: 1, Streams: 1}
-
-		t.Run("R3", func(t *testing.T) {
-			test(t, 3, accClaim)
-		})
-		t.Run("R1", func(t *testing.T) {
-			test(t, 1, accClaim)
-		})
-	})
-
-	t.Run("non-tiered", func(t *testing.T) {
-		accClaim := jwt.NewAccountClaims(aExpPub)
-		accClaim.Limits.JetStreamLimits = jwt.JetStreamLimits{
-			DiskStorage: 4400, Consumer: 2, Streams: 2}
-
-		t.Run("R3", func(t *testing.T) {
-			test(t, 3, accClaim)
-		})
-		t.Run("R1", func(t *testing.T) {
-			test(t, 1, accClaim)
-		})
-	})
 }
 
 func TestJetStreamJWTClusteredTiers(t *testing.T) {
