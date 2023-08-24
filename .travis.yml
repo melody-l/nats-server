@@ -8,8 +8,8 @@ language: go
 go:
 # This should be quoted or use .x, but should not be unquoted.
 # Remember that a YAML bare float drops trailing zeroes.
-  - "1.19.12"
   - "1.20.x"
+  - "1.21.x"
 
 go_import_path: github.com/nats-io/nats-server
 
@@ -43,6 +43,8 @@ jobs:
     - name: "Compile with older Go release"
       go: "1.19.12"
       env: TEST_SUITE=build_only
+  allow_failures:
+    - name: "1.21.x"
 
 script: ./scripts/runTestsOnTravis.sh $TEST_SUITE
 
