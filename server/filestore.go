@@ -3271,7 +3271,7 @@ func (mb *msgBlock) flushLoop(fch, qch chan struct{}) {
 
 	// Will use to test if we have meta data updates.
 	var firstSeq, lastSeq uint64
-	var dmapLen int
+	var dmapLen uint64
 
 	infoChanged := func() bool {
 		mb.mu.RLock()
@@ -5127,10 +5127,7 @@ func (fs *fileStore) FastState(state *StreamState) {
 	state.LastSeq = fs.state.LastSeq
 	state.LastTime = fs.state.LastTime
 	if state.LastSeq > state.FirstSeq {
-		state.NumDeleted = int((state.LastSeq - state.FirstSeq + 1) - state.Msgs)
-		if state.NumDeleted < 0 {
-			state.NumDeleted = 0
-		}
+		state.NumDeleted = uint64((state.LastSeq - state.FirstSeq + 1) - state.Msgs)
 	}
 	state.Consumers = len(fs.cfs)
 	state.NumSubjects = fs.numSubjects()
@@ -5180,7 +5177,7 @@ func (fs *fileStore) State() StreamState {
 		sort.Slice(state.Deleted, func(i, j int) bool {
 			return state.Deleted[i] < state.Deleted[j]
 		})
-		state.NumDeleted = len(state.Deleted)
+		state.NumDeleted = uint64(len(state.Deleted))
 	}
 	return state
 }
@@ -5468,8 +5465,8 @@ func (fs *fileStore) cacheSize() uint64 {
 }
 
 // Will return total number of dmapEntries for all msg blocks.
-func (fs *fileStore) dmapEntries() int {
-	var total int
+func (fs *fileStore) dmapEntries() uint64 {
+	var total uint64
 	fs.mu.RLock()
 	for _, mb := range fs.blks {
 		total += mb.dmap.Size()
