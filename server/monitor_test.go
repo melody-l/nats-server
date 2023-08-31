@@ -1186,75 +1186,86 @@ func TestConnzSortedByIdle(t *testing.T) {
 	s := runMonitorServer()
 	defer s.Shutdown()
 
-	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	url := fmt.Sprintf("http://%s/connz?sort=idle", s.MonitorAddr())
+	now := time.Now()
+
+	clients := []struct {
+		start time.Time // Client start time.
+		last  time.Time // Client last activity time.
+	}{
+		{start: now.Add(-10 * time.Second), last: now.Add(-5 * time.Second)},
+		{start: now.Add(-20 * time.Second), last: now.Add(-10 * time.Second)},
+		{start: now.Add(-3 * time.Second), last: now.Add(-2 * time.Second)},
+		{start: now.Add(-30 * time.Second), last: now.Add(-20 * time.Second)},
+	}
 
 	testIdle := func(mode int) {
-		firstClient := createClientConnSubscribeAndPublish(t, s)
-		defer firstClient.Close()
-		firstClient.Subscribe("client.1", func(m *nats.Msg) {})
-		firstClient.Flush()
+		// Connect the specified number of clients.
+		for _, clientTime := range clients {
+			clientConn := createClientConnSubscribeAndPublish(t, s)
+			defer clientConn.Close()
 
-		secondClient := createClientConnSubscribeAndPublish(t, s)
-		defer secondClient.Close()
+			cid, err := clientConn.GetClientID()
+			if err != nil {
+				t.Fatalf("error getting the client CID: %v", err)
+			}
 
-		// Make it such that the second client started 10 secs ago. 10 is important since bug
-		// was strcmp, e.g. 1s vs 11s
-		var cid uint64
-		switch mode {
-		case 0:
-			cid = uint64(2)
-		case 1:
-			cid = uint64(4)
-		}
-		client := s.getClient(cid)
-		if client == nil {
-			t.Fatalf("Error looking up client %v\n", 2)
-		}
+			client := s.getClient(cid)
+			if client == nil {
+				t.Fatalf("error looking up client %d", cid)
+			}
 
-		// We want to make sure that we set start/last after the server has finished
-		// updating this client's last activity. Doing another Flush() now (even though
-		// one is done in createClientConnSubscribeAndPublish) ensures that server has
-		// finished updating the client's last activity, since for that last flush there
-		// should be no new message/sub/unsub activity.
-		secondClient.Flush()
-
-		client.mu.Lock()
-		client.start = client.start.Add(-10 * time.Second)
-		client.last = client.start
-		client.mu.Unlock()
-
-		// The Idle granularity is a whole second
-		time.Sleep(time.Second)
-		firstClient.Publish("client.1", []byte("new message"))
-
-		c := pollConz(t, s, mode, url+"connz?sort=idle", &ConnzOptions{Sort: ByIdle})
-		// Make sure we are returned 2 connections...
-		if len(c.Conns) != 2 {
-			t.Fatalf("Expected to get two connections, got %v", len(c.Conns))
+			// Change the client's start and last activity times.
+			client.mu.Lock()
+			client.start = clientTime.start
+			client.last = clientTime.last
+			client.mu.Unlock()
 		}
 
-		// And that the Idle time is valid (even if equal to "0s")
-		if c.Conns[0].Idle == "" || c.Conns[1].Idle == "" {
-			t.Fatal("Expected Idle value to be valid")
+		c := pollConz(t, s, mode, url, &ConnzOptions{Sort: ByIdle})
+
+		wantConns := len(clients)
+		gotConns := len(c.Conns)
+
+		if gotConns != wantConns {
+			t.Fatalf("want %d connections, got %d", wantConns, gotConns)
 		}
 
-		idle1, err := time.ParseDuration(c.Conns[0].Idle)
-		if err != nil {
-			t.Fatalf("Unable to parse duration %v, err=%v", c.Conns[0].Idle, err)
-		}
-		idle2, err := time.ParseDuration(c.Conns[1].Idle)
-		if err != nil {
-			t.Fatalf("Unable to parse duration %v, err=%v", c.Conns[0].Idle, err)
-		}
+		idleDurations := getConnsIdleDurations(t, c.Conns)
 
-		if idle2 < idle1 {
-			t.Fatalf("Expected conns sorted in descending order by Idle, got %v < %v\n",
-				idle2, idle1)
+		if !sortedDurationsDesc(idleDurations) {
+			t.Errorf("want durations sorted in descending order, got %v", idleDurations)
 		}
 	}
+
 	for mode := 0; mode < 2; mode++ {
 		testIdle(mode)
 	}
+}
+
+// getConnsIdleDurations returns a slice of parsed idle durations from a connection info slice.
+func getConnsIdleDurations(t *testing.T, conns []*ConnInfo) []time.Duration {
+	t.Helper()
+
+	durations := make([]time.Duration, 0, len(conns))
+
+	for _, conn := range conns {
+		idle, err := time.ParseDuration(conn.Idle)
+		if err != nil {
+			t.Fatalf("error parsing duration %q: %v", conn.Idle, err)
+		}
+		durations = append(durations, idle)
+	}
+
+	return durations
+}
+
+// sortedDurationsDesc checks if a time.Duration slice is sorted in descending order.
+func sortedDurationsDesc(durations []time.Duration) bool {
+	return sort.SliceIsSorted(durations, func(i, j int) bool {
+		// Must be longer than the next duration.
+		return durations[i] > durations[j]
+	})
 }
 
 func TestConnzSortBadRequest(t *testing.T) {
