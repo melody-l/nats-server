@@ -4183,7 +4183,9 @@ func TestJetStreamClusterRedeliverBackoffs(t *testing.T) {
 	var received []time.Time
 	var mu sync.Mutex
 
+	asdf := time.Now()
 	sub, err := nc.Subscribe("x", func(m *nats.Msg) {
+		t.Logf("======> %+v || %+v || %+v", time.Now(), time.Since(asdf), m)
 		mu.Lock()
 		received = append(received, time.Now())
 		mu.Unlock()
@@ -4214,7 +4216,7 @@ func TestJetStreamClusterRedeliverBackoffs(t *testing.T) {
 		// Adjust start for next calcs.
 		start = start.Add(d)
 		if d < expected[i] || d > expected[i]*2 {
-			t.Fatalf("Timing is off for %d, expected ~%v, but got %v", i, expected[i], d)
+			t.Fatalf("Timing is off for [%d], expected ~%v, but got %v", i, expected[i], d)
 		}
 	}
 }
