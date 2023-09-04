@@ -52,6 +52,8 @@ type FileStoreConfig struct {
 	CacheExpire time.Duration
 	// SyncInterval is how often we sync to disk in the background.
 	SyncInterval time.Duration
+	// SyncAlways is when the stream should sync all data writes.
+	SyncAlways bool
 	// AsyncFlush allows async flush to batch write operations.
 	AsyncFlush bool
 	// Cipher is the cipher to use when encrypting.
@@ -186,42 +188,44 @@ type fileStore struct {
 // Represents a message store block and its data.
 type msgBlock struct {
 	// Here for 32bit systems and atomic.
-	first   msgId
-	last    msgId
-	mu      sync.RWMutex
-	fs      *fileStore
-	aek     cipher.AEAD
-	bek     cipher.Stream
-	seed    []byte
-	nonce   []byte
-	mfn     string
-	mfd     *os.File
-	cmp     StoreCompression // Effective compression at the time of loading the block
-	liwsz   int64
-	index   uint32
-	bytes   uint64 // User visible bytes count.
-	rbytes  uint64 // Total bytes (raw) including deleted. Used for rolling to new blk.
-	msgs    uint64 // User visible message count.
-	fss     map[string]*SimpleState
-	kfn     string
-	lwts    int64
-	llts    int64
-	lrts    int64
-	llseq   uint64
-	hh      hash.Hash64
-	cache   *cache
-	cloads  uint64
-	cexp    time.Duration
-	ctmr    *time.Timer
-	werr    error
-	dmap    avl.SequenceSet
-	fch     chan struct{}
-	qch     chan struct{}
-	lchk    [8]byte
-	loading bool
-	flusher bool
-	noTrack bool
-	closed  bool
+	first      msgId
+	last       msgId
+	mu         sync.RWMutex
+	fs         *fileStore
+	aek        cipher.AEAD
+	bek        cipher.Stream
+	seed       []byte
+	nonce      []byte
+	mfn        string
+	mfd        *os.File
+	cmp        StoreCompression // Effective compression at the time of loading the block
+	liwsz      int64
+	index      uint32
+	bytes      uint64 // User visible bytes count.
+	rbytes     uint64 // Total bytes (raw) including deleted. Used for rolling to new blk.
+	msgs       uint64 // User visible message count.
+	fss        map[string]*SimpleState
+	kfn        string
+	lwts       int64
+	llts       int64
+	lrts       int64
+	llseq      uint64
+	hh         hash.Hash64
+	cache      *cache
+	cloads     uint64
+	cexp       time.Duration
+	ctmr       *time.Timer
+	werr       error
+	dmap       avl.SequenceSet
+	fch        chan struct{}
+	qch        chan struct{}
+	lchk       [8]byte
+	loading    bool
+	flusher    bool
+	noTrack    bool
+	needSync   bool
+	syncAlways bool
+	closed     bool
 
 	// Used to mock write failures.
 	mockWriteErr bool
@@ -285,7 +289,7 @@ const (
 	// default cache buffer expiration
 	defaultCacheBufferExpiration = 5 * time.Second
 	// default sync interval
-	defaultSyncInterval = 60 * time.Second
+	defaultSyncInterval = 2 * time.Minute
 	// default idle timeout to close FDs.
 	closeFDsIdle = 30 * time.Second
 	// coalesceMinimum
@@ -846,7 +850,7 @@ func (fs *fileStore) noTrackSubjects() bool {
 
 // Will init the basics for a message block.
 func (fs *fileStore) initMsgBlock(index uint32) *msgBlock {
-	mb := &msgBlock{fs: fs, index: index, cexp: fs.fcfg.CacheExpire, noTrack: fs.noTrackSubjects()}
+	mb := &msgBlock{fs: fs, index: index, cexp: fs.fcfg.CacheExpire, noTrack: fs.noTrackSubjects(), syncAlways: fs.fcfg.SyncAlways}
 
 	mdir := filepath.Join(fs.fcfg.StoreDir, msgDir)
 	mb.mfn = filepath.Join(mdir, fmt.Sprintf(blkScan, index))
@@ -2774,7 +2778,7 @@ func (fs *fileStore) newMsgBlockForWrite() (*msgBlock, error) {
 		}
 	}
 
-	mb := &msgBlock{fs: fs, index: index, cexp: fs.fcfg.CacheExpire, noTrack: fs.noTrackSubjects()}
+	mb := &msgBlock{fs: fs, index: index, cexp: fs.fcfg.CacheExpire, noTrack: fs.noTrackSubjects(), syncAlways: fs.fcfg.SyncAlways}
 
 	// Lock should be held to quiet race detector.
 	mb.mu.Lock()
@@ -4403,10 +4407,16 @@ func (mb *msgBlock) pendingWriteSize() int {
 	if mb == nil {
 		return 0
 	}
-
 	mb.mu.RLock()
 	defer mb.mu.RUnlock()
+	return mb.pendingWriteSizeLocked()
+}
 
+// How many bytes pending to be written for this message block.
+func (mb *msgBlock) pendingWriteSizeLocked() int {
+	if mb == nil {
+		return 0
+	}
 	var pending int
 	if !mb.closed && mb.mfd != nil && mb.cache != nil {
 		pending = len(mb.cache.buf) - int(mb.cache.wp)
@@ -4680,22 +4690,44 @@ func (fs *fileStore) syncBlocks() {
 	fs.mu.RUnlock()
 
 	for _, mb := range blks {
-		// Flush anything that may be pending.
-		if mb.pendingWriteSize() > 0 {
-			mb.flushPendingMsgs()
-		}
 		// Do actual sync. Hold lock for consistency.
 		mb.mu.Lock()
-		if !mb.closed {
+		if mb.closed {
+			mb.mu.Unlock()
+			continue
+		}
+		if mb.needSync {
+			// Flush anything that may be pending.
+			if mb.pendingWriteSizeLocked() > 0 {
+				mb.flushPendingMsgsLocked()
+			}
 			if mb.mfd != nil {
 				mb.mfd.Sync()
+			} else {
+				fd, err := os.OpenFile(mb.mfn, os.O_RDWR, defaultFilePerms)
+				if err != nil {
+					mb.mu.Unlock()
+					continue
+				}
+				fd.Sync()
+				fd.Close()
 			}
-			// See if we can close FDs due to being idle.
-			if mb.mfd != nil && mb.sinceLastWriteActivity() > closeFDsIdle {
-				mb.dirtyCloseWithRemove(false)
-			}
+			mb.needSync = false
+		}
+		// See if we can close FDs due to being idle.
+		if mb.mfd != nil && mb.sinceLastWriteActivity() > closeFDsIdle {
+			mb.dirtyCloseWithRemove(false)
 		}
 		mb.mu.Unlock()
+	}
+
+	fs.mu.RLock()
+	fn := filepath.Join(fs.fcfg.StoreDir, msgDir, streamStreamStateFile)
+	fs.mu.RUnlock()
+
+	if fd, _ := os.OpenFile(fn, os.O_RDWR, defaultFilePerms); fd != nil {
+		fd.Sync()
+		fd.Close()
 	}
 
 	fs.mu.Lock()
@@ -4960,6 +4992,11 @@ func (mb *msgBlock) flushPendingMsgsLocked() (*LostStreamData, error) {
 	// Cache may be gone.
 	if mb.cache == nil || mb.mfd == nil {
 		return fsLostData, mb.werr
+	}
+
+	// Check if we are in sync always mode.
+	if mb.syncAlways {
+		mb.mfd.Sync()
 	}
 
 	// Check for additional writes while we were writing to the disk.
@@ -6902,7 +6939,9 @@ func (fs *fileStore) writeFullState() error {
 	}
 	tmpName := f.Name()
 	defer os.Remove(tmpName)
-	_, err = f.Write(buf)
+	if _, err = f.Write(buf); err == nil && fs.fcfg.SyncAlways {
+		f.Sync()
+	}
 	f.Close()
 	if err != nil {
 		return err
