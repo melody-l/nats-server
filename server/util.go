@@ -14,14 +14,15 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"net"
 	"net/url"
 	"reflect"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -37,11 +38,9 @@ const (
 	asciiNine = 57
 )
 
-var semVerRe = regexp.MustCompile(`\Av?([0-9]+)\.?([0-9]+)?\.?([0-9]+)?`)
-
 func versionComponents(version string) (major, minor, patch int, err error) {
 	m := semVerRe.FindStringSubmatch(version)
-	if m == nil {
+	if len(m) == 0 {
 		return 0, 0, 0, errors.New("invalid semver")
 	}
 	major, err = strconv.Atoi(m[1])
@@ -333,4 +332,11 @@ func copyStrings(src []string) []string {
 	dst := make([]string, len(src))
 	copy(dst, src)
 	return dst
+}
+
+// Returns a byte slice for the INFO protocol.
+func generateInfoJSON(info *Info) []byte {
+	b, _ := json.Marshal(info)
+	pcs := [][]byte{[]byte("INFO"), b, []byte(CR_LF)}
+	return bytes.Join(pcs, []byte(" "))
 }

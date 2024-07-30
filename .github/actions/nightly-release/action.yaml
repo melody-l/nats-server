@@ -26,12 +26,12 @@ runs:
   using: composite
   steps:
     - name: Set up Go
-      uses: actions/setup-go@v3
+      uses: actions/setup-go@v4
       with:
         go-version: "${{ inputs.go }}"
 
     - name: goreleaser
-      uses: goreleaser/goreleaser-action@v3
+      uses: goreleaser/goreleaser-action@v5
       with:
         workdir: "${{ inputs.workdir }}"
         version: latest

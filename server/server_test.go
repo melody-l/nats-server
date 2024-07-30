@@ -1,4 +1,4 @@
-// Copyright 2012-2020 The NATS Authors
+// Copyright 2012-2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -34,6 +35,7 @@ import (
 	"testing"
 	"time"
 
+	srvlog "github.com/nats-io/nats-server/v2/logger"
 	"github.com/nats-io/nats.go"
 )
 
@@ -85,6 +87,13 @@ func RunServer(opts *Options) *Server {
 		s.ConfigureLogger()
 	}
 
+	if ll := os.Getenv("NATS_LOGGING"); ll != "" {
+		log := srvlog.NewTestLogger(fmt.Sprintf("[%s] | ", s), true)
+		debug := ll == "debug" || ll == "trace"
+		trace := ll == "trace"
+		s.SetLoggerV2(log, debug, trace, false)
+	}
+
 	// Run server in Go routine.
 	s.Start()
 
@@ -112,6 +121,12 @@ func RunServerWithConfig(configFile string) (srv *Server, opts *Options) {
 	return
 }
 
+func TestSemanticVersion(t *testing.T) {
+	if !semVerRe.MatchString(VERSION) {
+		t.Fatalf("Version (%s) is not a valid SemVer string", VERSION)
+	}
+}
+
 func TestVersionMatchesTag(t *testing.T) {
 	tag := os.Getenv("TRAVIS_TAG")
 	// Travis started to return '' when no tag is set. Support both now.
@@ -127,6 +142,17 @@ func TestVersionMatchesTag(t *testing.T) {
 	// Strip the `v` from the tag for the version comparison.
 	if VERSION != tag[1:] {
 		t.Fatalf("Version (%s) does not match tag (%s)", VERSION, tag[1:])
+	}
+	// Check that the version dynamically set via ldflags matches the version
+	// from the server previous to releasing.
+	if serverVersion == _EMPTY_ {
+		t.Fatal("Version missing in ldflags")
+	}
+	// Unlike VERSION constant, serverVersion is prefixed with a 'v'
+	// since it should be the same as the git tag.
+	expected := "v" + VERSION
+	if serverVersion != _EMPTY_ && expected != serverVersion {
+		t.Fatalf("Version (%s) does not match ldflags version (%s)", expected, serverVersion)
 	}
 }
 
@@ -419,7 +445,7 @@ func TestClientAdvertiseInCluster(t *testing.T) {
 
 	checkURLs := func(expected string) {
 		t.Helper()
-		checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
 			srvs := nc.DiscoveredServers()
 			for _, u := range srvs {
 				if u == expected {
@@ -441,7 +467,7 @@ func TestClientAdvertiseInCluster(t *testing.T) {
 	checkURLs("nats://srvBC:4222")
 
 	srvB.Shutdown()
-	checkNumRoutes(t, srvA, 1)
+	checkNumRoutes(t, srvA, DEFAULT_ROUTE_POOL_SIZE+1)
 	checkURLs("nats://srvBC:4222")
 }
 
@@ -611,6 +637,8 @@ func TestNilMonitoringPort(t *testing.T) {
 type DummyAuth struct {
 	t         *testing.T
 	needNonce bool
+	deadline  time.Time
+	register  bool
 }
 
 func (d *DummyAuth) Check(c ClientAuthentication) bool {
@@ -620,12 +648,26 @@ func (d *DummyAuth) Check(c ClientAuthentication) bool {
 		d.t.Fatalf("Received a nonce when none was expected")
 	}
 
-	return c.GetOpts().Username == "valid"
+	if c.GetOpts().Username != "valid" {
+		return false
+	}
+
+	if !d.register {
+		return true
+	}
+
+	u := &User{
+		Username:           c.GetOpts().Username,
+		ConnectionDeadline: d.deadline,
+	}
+	c.RegisterUser(u)
+
+	return true
 }
 
 func TestCustomClientAuthentication(t *testing.T) {
 	testAuth := func(t *testing.T, nonce bool) {
-		clientAuth := &DummyAuth{t, nonce}
+		clientAuth := &DummyAuth{t: t, needNonce: nonce}
 
 		opts := DefaultOptions()
 		opts.CustomClientAuthentication = clientAuth
@@ -675,7 +717,8 @@ func TestCustomRouterAuthentication(t *testing.T) {
 	s3 := RunServer(opts3)
 	defer s3.Shutdown()
 	checkClusterFormed(t, s, s3)
-	checkNumRoutes(t, s3, 1)
+	// Default pool size + 1 for system account
+	checkNumRoutes(t, s3, DEFAULT_ROUTE_POOL_SIZE+1)
 }
 
 func TestMonitoringNoTimeout(t *testing.T) {
@@ -756,10 +799,7 @@ func TestLameDuckMode(t *testing.T) {
 
 	// Check that if there is no client, server is shutdown
 	srvA.lameDuckMode()
-	srvA.mu.Lock()
-	shutdown := srvA.shutdown
-	srvA.mu.Unlock()
-	if !shutdown {
+	if !srvA.isShuttingDown() {
 		t.Fatalf("Server should have shutdown")
 	}
 
@@ -1205,9 +1245,7 @@ func TestServerValidateGatewaysOptions(t *testing.T) {
 func TestAcceptError(t *testing.T) {
 	o := DefaultOptions()
 	s := New(o)
-	s.mu.Lock()
-	s.running = true
-	s.mu.Unlock()
+	s.running.Store(true)
 	defer s.Shutdown()
 	orgDelay := time.Hour
 	delay := s.acceptError("Test", fmt.Errorf("any error"), orgDelay)
@@ -2067,4 +2105,98 @@ func TestServerRateLimitLogging(t *testing.T) {
 	c2.RateLimitWarnf("Warning number 2")
 
 	checkLog(c1, c2)
+}
+
+// https://github.com/nats-io/nats-server/discussions/4535
+func TestServerAuthBlockAndSysAccounts(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		server_name: s-test
+		authorization {
+			users = [ { user: "u", password: "pass"} ]
+		}
+		accounts {
+			$SYS: { users: [ { user: admin, password: pwd } ] }
+		}
+	`))
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// This should work of course.
+	nc, err := nats.Connect(s.ClientURL(), nats.UserInfo("u", "pass"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	// This should not.
+	_, err = nats.Connect(s.ClientURL())
+	require_Error(t, err, nats.ErrAuthorization, errors.New("nats: Authorization Violation"))
+}
+
+// https://github.com/nats-io/nats-server/issues/5396
+func TestServerConfigLastLineComments(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+	{
+		"listen":  "0.0.0.0:4222"
+	}
+	# wibble
+	`))
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// This should work of course.
+	nc, err := nats.Connect(s.ClientURL())
+	require_NoError(t, err)
+	defer nc.Close()
+}
+
+func TestServerClusterAndGatewayNameNoSpace(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		port: -1
+		server_name: "my server"
+	`))
+	_, err := ProcessConfigFile(conf)
+	require_Error(t, err, ErrServerNameHasSpaces)
+
+	o := DefaultOptions()
+	o.ServerName = "my server"
+	_, err = NewServer(o)
+	require_Error(t, err, ErrServerNameHasSpaces)
+
+	conf = createConfFile(t, []byte(`
+		port: -1
+		server_name: "myserver"
+		cluster {
+			port: -1
+			name: "my cluster"
+		}
+	`))
+	_, err = ProcessConfigFile(conf)
+	require_Error(t, err, ErrClusterNameHasSpaces)
+
+	o = DefaultOptions()
+	o.Cluster.Name = "my cluster"
+	o.Cluster.Port = -1
+	_, err = NewServer(o)
+	require_Error(t, err, ErrClusterNameHasSpaces)
+
+	conf = createConfFile(t, []byte(`
+		port: -1
+		server_name: "myserver"
+		gateway {
+			port: -1
+			name: "my gateway"
+		}
+	`))
+	_, err = ProcessConfigFile(conf)
+	require_Error(t, err, ErrGatewayNameHasSpaces)
+
+	o = DefaultOptions()
+	o.Cluster.Name = _EMPTY_
+	o.Cluster.Port = 0
+	o.Gateway.Name = "my gateway"
+	o.Gateway.Port = -1
+	_, err = NewServer(o)
+	require_Error(t, err, ErrGatewayNameHasSpaces)
 }

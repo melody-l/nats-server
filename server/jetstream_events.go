@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-func (s *Server) publishAdvisory(acc *Account, subject string, adv interface{}) {
+func (s *Server) publishAdvisory(acc *Account, subject string, adv any) {
 	if acc == nil {
 		acc = s.SystemAccount()
 		if acc == nil {
@@ -80,6 +80,18 @@ type JSConsumerActionAdvisory struct {
 
 const JSConsumerActionAdvisoryType = "io.nats.jetstream.advisory.v1.consumer_action"
 
+// JSConsumerPauseAdvisory indicates that a consumer was paused or unpaused
+type JSConsumerPauseAdvisory struct {
+	TypedEvent
+	Stream     string    `json:"stream"`
+	Consumer   string    `json:"consumer"`
+	Paused     bool      `json:"paused"`
+	PauseUntil time.Time `json:"pause_until,omitempty"`
+	Domain     string    `json:"domain,omitempty"`
+}
+
+const JSConsumerPauseAdvisoryType = "io.nats.jetstream.advisory.v1.consumer_pause"
+
 // JSConsumerAckMetric is a metric published when a user acknowledges a message, the
 // number of these that will be published is dependent on SampleFrequency
 type JSConsumerAckMetric struct {
@@ -134,6 +146,7 @@ type JSConsumerDeliveryTerminatedAdvisory struct {
 	ConsumerSeq uint64 `json:"consumer_seq"`
 	StreamSeq   uint64 `json:"stream_seq"`
 	Deliveries  uint64 `json:"deliveries"`
+	Reason      string `json:"reason,omitempty"`
 	Domain      string `json:"domain,omitempty"`
 }
 
@@ -192,10 +205,22 @@ const JSRestoreCompleteAdvisoryType = "io.nats.jetstream.advisory.v1.restore_com
 
 // Clustering specific.
 
-// JSStreamLeaderElectedAdvisoryType is sent when the system elects a leader for a stream.
+// JSClusterLeaderElectedAdvisoryType is sent when the system elects a new meta leader.
+const JSDomainLeaderElectedAdvisoryType = "io.nats.jetstream.advisory.v1.domain_leader_elected"
+
+// JSClusterLeaderElectedAdvisory indicates that a domain has elected a new leader.
+type JSDomainLeaderElectedAdvisory struct {
+	TypedEvent
+	Leader   string      `json:"leader"`
+	Replicas []*PeerInfo `json:"replicas"`
+	Cluster  string      `json:"cluster"`
+	Domain   string      `json:"domain,omitempty"`
+}
+
+// JSStreamLeaderElectedAdvisoryType is sent when the system elects a new leader for a stream.
 const JSStreamLeaderElectedAdvisoryType = "io.nats.jetstream.advisory.v1.stream_leader_elected"
 
-// JSStreamLeaderElectedAdvisory indicates that a stream has lost quorum and is stalled.
+// JSStreamLeaderElectedAdvisory indicates that a stream has elected a new leader.
 type JSStreamLeaderElectedAdvisory struct {
 	TypedEvent
 	Account  string      `json:"account,omitempty"`
@@ -221,7 +246,7 @@ type JSStreamQuorumLostAdvisory struct {
 // JSConsumerLeaderElectedAdvisoryType is sent when the system elects a leader for a consumer.
 const JSConsumerLeaderElectedAdvisoryType = "io.nats.jetstream.advisory.v1.consumer_leader_elected"
 
-// JSConsumerLeaderElectedAdvisory indicates that a stream has lost quorum and is stalled.
+// JSConsumerLeaderElectedAdvisory indicates that a consumer has elected a new leader.
 type JSConsumerLeaderElectedAdvisory struct {
 	TypedEvent
 	Account  string      `json:"account,omitempty"`
